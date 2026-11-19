@@ -1,0 +1,33 @@
+[package]
+name = "zinput"
+version = "0.1.3"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+authors = ["LIghtJUNction"]
+repository = "https://github.com/LIghtJUNction/zinput"
+description = "Bounded no_std input-method core, Linux evdev decoding and terminal input encoding"
+readme = "README.md"
+keywords = ["input-method", "no-std", "keyboard", "linux", "input"]
+categories = ["no-std", "encoding", "command-line-interface"]
+include = ["src/**", "tests/**", "examples/**", "benches/**", "tools/**", "docs/**", "Cargo.toml", "README.md", "LICENSE"]
+
+[features]
+default = []
+plugins = ["dep:zplugin"]
+
+[dependencies]
+zplugin = { version = "0.3.1", default-features = false, features = ["macros", "alloc"], optional = true }
+
+[[example]]
+name = "ime_engine"
+path = "examples/ime_engine.rs"
+crate-type = ["cdylib"]
+required-features = ["plugins"]
+test = false
+
+[[bench]]
+name = "ime"
+harness = false
+
+[workspace]
