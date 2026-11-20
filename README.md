@@ -9,7 +9,10 @@ Existing terminal encoding APIs use `alloc` for returned or reusable byte buffer
 The optional `plugins` feature adds a shared input-engine trait and a generated
 native ABI through `zplugin`. System library loading is centralized in `zsys`.
 Desktop input-method registration, keyboard-layout mapping and text delivery are
-provided by application frontends.
+provided by application frontends. The separate [zinput-wayland](native/wayland)
+package supplies a Linux input-method-v2 adapter with compositor keyboard grabs,
+XKB layout mapping, preedit/commit delivery and paired virtual-keyboard forwarding.
+It is optional and does not change the core library's default feature set.
 
 With `plugins` enabled, the runtime dependency chain is `zinput → zplugin →
 zsys`. Generating the typed interface also builds `zplugin-macros`, which uses

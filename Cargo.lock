@@ -45,6 +45,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "zinput-wayland"
+version = "0.1.0"
+dependencies = [
+ "zsys",
+]
+
+[[package]]
 name = "zplugin"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,14 @@
+[package]
+name = "zinput-wayland"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+authors = ["LIghtJUNction"]
+repository = "https://github.com/LIghtJUNction/zinput"
+description = "Native Wayland input-method-v2 frontend for Project Z input engines"
+readme = "README.md"
+include = ["src/**", "examples/**", "Cargo.toml", "README.md", "LICENSE"]
+
+[dependencies]
+zsys = { version = "0.1.1", default-features = false, features = ["dylib"] }
