@@ -88,3 +88,33 @@ A native failure-path check forces incompatible window depth and verifies that
 a subsequent candidate-window creation succeeds after rollback. These are
 transport checks; they do not establish behavior in every application or a
 desktop installation.
+
+
+## Ztty consumer acceptance
+
+The consumer check starts an owned private Xvfb and an isolated Ztty broker.
+It opens Ztty before the input service, then verifies XIM discovery, native
+Chinese and kana commits in the terminal's raw PTY, multiple windows, visible
+candidate placement, cancellation, and service restart recovery. The test uses
+XTEST key events and XIM text delivery. It never reads the desktop clipboard or
+attaches to an existing broker.
+
+Pass a Ztty source tree containing its shared private-display and PTY fixtures.
+The supplied Ztty binary is the actual program under test; it can be an
+installed release.
+
+```sh
+python3 native/x11/tests/check_ztty.py \
+  --ztty /absolute/path/to/ztty \
+  --ztty-source /absolute/path/to/ztty-source \
+  --server target/debug/examples/protocol_probe \
+  --server-mode probe --name fcitx \
+  --output /var/tmp/zinput-ztty-acceptance.json
+```
+
+For a full input engine, use `--server /absolute/path/to/ztype
+--server-mode ztype`, optionally `--dictionary PATH` and `--config PATH`.
+That mode launches `ztype x11`, sets `ZTYPE_XIM_NAME` to the requested private
+name, and verifies `nihao` and `shijie` composition. Add
+`--screenshot /var/tmp/zinput-ztty-candidate.png` to capture only the test's
+private display while its candidate window is visible.
