@@ -2,6 +2,7 @@
 """Check an installed Ztty against a real XIM service on an owned private Xvfb."""
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -53,6 +54,8 @@ def main():
     parser.add_argument("--name", default="fcitx")
     parser.add_argument("--dictionary", type=Path)
     parser.add_argument("--config", type=Path)
+    parser.add_argument("--expect-commit", nargs=2, action="append", default=[],
+                        metavar=("KEYS", "TEXT"), help="check an additional native PTY commit")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--screenshot", type=Path)
     args = parser.parse_args()
@@ -64,7 +67,11 @@ def main():
     from Xlib.ext import xtest
     report = {"ok":False, "scope":"installed Ztty, owned Xvfb, XTEST keys, XIM commit and raw PTY",
               "ztty":str(args.ztty.resolve()), "server":str(args.server.resolve()),
-              "server_mode":args.server_mode, "xim_name":args.name, "checks":[]}
+              "server_mode":args.server_mode, "xim_name":args.name, "checks":[],
+              "server_sha256":hashlib.sha256(args.server.read_bytes()).hexdigest(),
+              "ztty_sha256":hashlib.sha256(args.ztty.read_bytes()).hexdigest()}
+    if args.dictionary:
+        report["dictionary_sha256"]=hashlib.sha256(args.dictionary.read_bytes()).hexdigest()
     assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
     xvfb = connection = server = None
     report_path = args.output.resolve()
@@ -185,6 +192,8 @@ def main():
             check("multi-codepoint native commit reaches raw PTY",first,
                   "r" if args.server_mode=="probe" else "shijie ",
                   "かなカナ" if args.server_mode=="probe" else "世界")
+            for extra_keys, extra_text in args.expect_commit:
+                check("additional native commit: "+extra_keys.rstrip(),first,extra_keys,extra_text)
             second = launch("second")
             same_broker = first["info"]["broker_pid"]==second["info"]["broker_pid"]
             report["checks"].append({"name":"second window shares existing broker","ok":same_broker})
@@ -210,8 +219,22 @@ def main():
                                       "geometry":[x,y,width,height]})
             if args.screenshot:
                 from PIL import Image
-                raw=screen.root.get_image(0,0,screen.width_in_pixels,screen.height_in_pixels,X.ZPixmap,0xffffffff)
-                pixels=Image.frombytes("RGB",(screen.width_in_pixels,screen.height_in_pixels),raw.data,"raw","BGRX")
+                def capture_screen():
+                    raw=screen.root.get_image(0,0,screen.width_in_pixels,screen.height_in_pixels,X.ZPixmap,0xffffffff)
+                    return Image.frombytes("RGB",(screen.width_in_pixels,screen.height_in_pixels),raw.data,"raw","BGRX")
+                if args.server_mode=="ztype":
+                    # Mapping precedes the asynchronous glyph redraw. Capture the painted
+                    # root window, so a blank or occluded popup cannot pass as visible.
+                    def rendered_popup():
+                        frame=capture_screen()
+                        crop=frame.crop((x,y,x+width,y+height))
+                        colors=crop.getcolors(width*height) or []
+                        bright=sum(count for count,color in colors if min(color)>170)
+                        return frame if bright>50 and len(colors)>32 else None
+                    pixels=wait(rendered_popup,"candidate text painted on private screen")
+                    report["checks"].append({"name":"candidate popup text is painted on screen","ok":True})
+                else:
+                    pixels=capture_screen()
                 args.screenshot.parent.mkdir(parents=True,exist_ok=True)
                 pixels.save(args.screenshot)
                 report["screenshot"]=str(args.screenshot.resolve())

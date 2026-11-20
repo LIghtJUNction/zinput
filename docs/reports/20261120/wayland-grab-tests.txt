@@ -1,0 +1,34 @@
+RUN ['cargo', 'fmt', '--all']
+RUN ['cargo', 'test', '-p', 'zinput-wayland', '--offline']
+
+running 13 tests
+test popup::tests::hiding_or_context_changes_cannot_resurrect_pending_candidates ... ok
+test popup::tests::latest_queued_frame_replaces_previous_image ... ok
+test popup::tests::validates_complete_premultiplied_images_and_scale ... ok
+test tests::each_secure_purpose_and_hint_bypasses_composition ... ok
+test tests::external_edit_invalidates_once_without_a_focus_transition ... ok
+test tests::complete_utf8_updates_are_checked_before_marshalling ... ok
+test tests::activation_and_password_policy_apply_only_at_done ... ok
+test tests::initial_other_and_normal_echo_do_not_reset_twice ... ok
+test tests::popup_waits_for_partial_context_batches_to_complete ... ok
+test tests::retired_proxy_lives_through_sync_and_drain_and_cleans_up_on_failure ... ok
+test tests::retiring_grab_keeps_late_key_pairs_out_of_new_context_events ... ok
+test tests::external_generation_exhaustion_rejects_before_applying_state ... ok
+test tests::serial_is_protocol_u32_while_context_does_not_wrap ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+RUN ['cargo', 'clippy', '-p', 'zinput-wayland', '--all-targets', '--offline', '--', '-D', 'warnings']
+RUN ['git', 'diff', '--check']
+
+   Compiling zinput-wayland v0.1.0 (/home/lightjunction/Documents/GITHUB/project_z/dist/zinput-framework-fix-20261120/native/wayland)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 41s
+     Running unittests src/lib.rs (target/debug/build/zinput-wayland/40d48ab0aa4eb37d/out/zinput_wayland-40d48ab0aa4eb37d)
+   Doc-tests zinput_wayland
+    Checking zinput-wayland v0.1.0 (/home/lightjunction/Documents/GITHUB/project_z/dist/zinput-framework-fix-20261120/native/wayland)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.45s
