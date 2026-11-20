@@ -11,6 +11,14 @@ int main(int argc, char **argv) {
     setlocale(LC_ALL, "");
     Display *display = XOpenDisplay(NULL);
     if (!display) return 2;
+    if (argc == 3 && !strcmp(argv[1], "--keycode")) {
+        printf("%x\n", XKeysymToKeycode(display, XStringToKeysym(argv[2])));
+        XCloseDisplay(display); return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--hide-registration")) {
+        XDeleteProperty(display, DefaultRootWindow(display), XInternAtom(display, "XIM_SERVERS", False));
+        XSync(display, False); XCloseDisplay(display); return 0;
+    }
     if (argc == 3 && !strcmp(argv[1], "--inspect-popup")) {
         Window window = strtoul(argv[2], NULL, 0);
         XWindowAttributes attributes;

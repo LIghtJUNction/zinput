@@ -55,3 +55,24 @@ cargo build -p zinput-x11 --example protocol_probe --offline
 
 The `protocol_probe` example is a private-display test host. Application
 engines and desktop installation remain with the consuming application.
+
+The protocol regression also requires Xvfb, xdotool, and Xlib/Xext development
+libraries. It starts its own XIM name and disposable clients on an explicitly
+private display:
+
+```sh
+CARGO_TARGET_DIR=/var/tmp/zinput-x11-check cargo build \
+  -p zinput-x11 --example protocol_probe --locked --offline
+xvfb-run -a -s '-screen 0 1024x768x24 -nolisten tcp' \
+  env ZINPUT_X11_TEST_PRIVATE=1 python3 native/x11/tests/check_xim.py \
+  --server /var/tmp/zinput-x11-check/debug/examples/protocol_probe \
+  --output /var/tmp/zinput-x11-check/acceptance.json
+```
+
+The checks cover real XOpenIM/XCreateIC, Chinese and kana COMPOUND_TEXT commits,
+modifier shortcuts, release pairing, owner refusal, context changes, reset and
+destruction, invalid updates, and candidate placement/input transparency.
+A native failure-path check forces incompatible window depth and verifies that
+a subsequent candidate-window creation succeeds after rollback. These are
+transport checks; they do not establish behavior in every application or a
+desktop installation.

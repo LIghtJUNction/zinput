@@ -311,29 +311,39 @@ static int popup_visual(ZixServer *s) {
 }
 static int create_popup(ZixServer *s) {
     if (s->popup_window) return 1;
-    s->popup_colormap = xcb_generate_id(s->connection);
+    xcb_colormap_t colormap = xcb_generate_id(s->connection);
     if (!request_ok(s, xcb_create_colormap_checked(s->connection, XCB_COLORMAP_ALLOC_NONE,
-        s->popup_colormap, s->screen->root, s->popup_visual), "cannot create the candidate colormap")) return 0;
-    s->popup_window = xcb_generate_id(s->connection);
-    const uint32_t values[] = {0, 0, 1, XCB_EVENT_MASK_EXPOSURE, s->popup_colormap};
-    if (!request_ok(s, xcb_create_window_checked(s->connection, s->popup_depth, s->popup_window,
+        colormap, s->screen->root, s->popup_visual), "cannot create the candidate colormap")) return 0;
+    xcb_window_t window = xcb_generate_id(s->connection);
+    const uint32_t values[] = {0, 0, 1, XCB_EVENT_MASK_EXPOSURE, colormap};
+    if (!request_ok(s, xcb_create_window_checked(s->connection, s->popup_depth, window,
         s->screen->root, 0, 0, 1, 1, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT, s->popup_visual,
         XCB_CW_BACK_PIXEL | XCB_CW_BORDER_PIXEL | XCB_CW_OVERRIDE_REDIRECT |
-        XCB_CW_EVENT_MASK | XCB_CW_COLORMAP, values), "cannot create the candidate window")) return 0;
+        XCB_CW_EVENT_MASK | XCB_CW_COLORMAP, values), "cannot create the candidate window")) goto fail_colormap;
     if (!request_ok(s, xcb_shape_rectangles_checked(s->connection, XCB_SHAPE_SO_SET,
-        XCB_SHAPE_SK_INPUT, XCB_CLIP_ORDERING_UNSORTED, s->popup_window, 0, 0, 0, NULL),
-        "cannot make the candidate window input-transparent")) return 0;
+        XCB_SHAPE_SK_INPUT, XCB_CLIP_ORDERING_UNSORTED, window, 0, 0, 0, NULL),
+        "cannot make the candidate window input-transparent")) goto fail_window;
     const char title[] = "zinput-x11 candidate popup";
-    xcb_change_property(s->connection, XCB_PROP_MODE_REPLACE, s->popup_window,
+    xcb_change_property(s->connection, XCB_PROP_MODE_REPLACE, window,
         XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 8, sizeof(title)-1, title);
     xcb_atom_t type = atom(s, "_NET_WM_WINDOW_TYPE_TOOLTIP");
     xcb_atom_t property = atom(s, "_NET_WM_WINDOW_TYPE");
     if (type && property)
-        xcb_change_property(s->connection, XCB_PROP_MODE_REPLACE, s->popup_window,
+        xcb_change_property(s->connection, XCB_PROP_MODE_REPLACE, window,
             property, XCB_ATOM_ATOM, 32, 1, &type);
-    s->popup_gc = xcb_generate_id(s->connection);
-    return request_ok(s, xcb_create_gc_checked(s->connection, s->popup_gc, s->popup_window, 0, NULL),
-        "cannot create the candidate drawing context");
+    xcb_gcontext_t gc = xcb_generate_id(s->connection);
+    if (!request_ok(s, xcb_create_gc_checked(s->connection, gc, window, 0, NULL),
+        "cannot create the candidate drawing context")) goto fail_window;
+    s->popup_colormap = colormap;
+    s->popup_window = window;
+    s->popup_gc = gc;
+    return 1;
+fail_window:
+    xcb_destroy_window(s->connection, window);
+fail_colormap:
+    xcb_free_colormap(s->connection, colormap);
+    xcb_flush(s->connection);
+    return 0;
 }
 int zix_popup_supported(ZixServer *s) { return s->popup_available; }
 
