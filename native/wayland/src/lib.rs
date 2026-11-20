@@ -1099,7 +1099,11 @@ impl Drop for InputMethod {
     fn drop(&mut self) {
         drop(self.popup.take());
         self.release_forwarded();
-        if !self.input.is_null() && self.state.current.active && !self.connection.state.unavailable
+        if !self.input.is_null()
+            && self.state.current.active
+            && !self.state.current.sensitive
+            && self.preedit_present
+            && !self.connection.state.unavailable
         {
             let _ = self.send_text("", 0, None);
         }
