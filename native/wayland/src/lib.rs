@@ -198,10 +198,30 @@ enum RawEvent {
     PopupRectangle(PopupRectangle),
     PopupUnavailable,
     Done,
-    Keymap(File, Vec<u8>),
-    Key { time: u32, code: u32, pressed: bool },
-    Modifiers([u32; 4]),
-    Repeat { rate: i32, delay: i32 },
+    Keymap(Proxy, File, Vec<u8>),
+    Key {
+        grab: Proxy,
+        time: u32,
+        code: u32,
+        pressed: bool,
+    },
+    Modifiers(Proxy, [u32; 4]),
+    Repeat {
+        grab: Proxy,
+        rate: i32,
+        delay: i32,
+    },
+}
+impl RawEvent {
+    fn keyboard_grab(&self) -> Option<Proxy> {
+        match self {
+            Self::Keymap(grab, ..)
+            | Self::Modifiers(grab, ..)
+            | Self::Key { grab, .. }
+            | Self::Repeat { grab, .. } => Some(*grab),
+            _ => None,
+        }
+    }
 }
 #[derive(Default)]
 struct State {
@@ -226,6 +246,18 @@ impl State {
         } else {
             self.events.push_back(event);
         }
+    }
+    fn take_grab_events(&mut self, grab: Proxy) -> VecDeque<RawEvent> {
+        let mut retired = VecDeque::new();
+        for _ in 0..self.events.len() {
+            let event = self.events.pop_front().expect("queue length was checked");
+            if event.keyboard_grab() == Some(grab) {
+                retired.push_back(event);
+            } else {
+                self.events.push_back(event);
+            }
+        }
+        retired
     }
     fn check(&mut self) -> Result<()> {
         if let Some(error) = self.failure.take() {
@@ -593,6 +625,26 @@ struct Repeat {
     next: Instant,
 }
 
+// Own the still-listening proxy across the release synchronization and drain.
+// The display/library outlive this local guard, including failure paths.
+struct RetiredGrab {
+    proxy: Proxy,
+    destroy: unsafe extern "C" fn(Proxy),
+}
+impl RetiredGrab {
+    fn finish(self, drain: impl FnOnce(Proxy) -> Result<()>) -> Result<()> {
+        let result = drain(self.proxy);
+        drop(self);
+        result
+    }
+}
+impl Drop for RetiredGrab {
+    fn drop(&mut self) {
+        // SAFETY: the guard owns exactly one live local proxy.
+        unsafe { (self.destroy)(self.proxy) }
+    }
+}
+
 /// Native frontend for one seat. Keep it on the constructing thread and call
 /// `dispatch` followed by `next_event` until the queue is drained. Composition
 /// policy and candidate UI remain in the engine/application.
@@ -741,37 +793,22 @@ impl InputMethod {
                         if current.active && self.preedit_present {
                             self.send_text("", 0, None)?;
                         }
-                        self.release_grab();
+                        self.release_grab()?;
                     }
                     self.connection.flush()?;
                     return Ok(Some(Event::State(current)));
                 }
-                RawEvent::Keymap(file, bytes) => {
-                    if self.grab.is_null() {
+                RawEvent::Keymap(grab, file, bytes) => {
+                    if grab != self.grab || grab.is_null() {
                         continue;
                     }
-                    let mut keymap = xkb::Keymap::new(&bytes)?;
-                    self.release_forwarded();
-                    keymap.modifiers(self.raw_modifiers);
-                    // SAFETY: libwayland duplicates the fd while marshalling it;
-                    // the owned File can close after the request is queued.
-                    unsafe {
-                        (self.connection.api.marshal)(
-                            self.keyboard,
-                            0,
-                            ptr::null(),
-                            1,
-                            0,
-                            1u32,
-                            file.as_raw_fd(),
-                            bytes.len() as u32,
-                        );
-                    }
-                    self.keymap = Some(keymap);
-                    self.send_modifiers(self.raw_modifiers);
+                    self.install_keymap(file, &bytes)?;
                     self.connection.flush()?;
                 }
-                RawEvent::Modifiers(mask) => {
+                RawEvent::Modifiers(grab, mask) => {
+                    if grab != self.grab || grab.is_null() {
+                        continue;
+                    }
                     self.raw_modifiers = mask;
                     if let Some(keymap) = self.keymap.as_mut() {
                         keymap.modifiers(mask);
@@ -779,7 +816,10 @@ impl InputMethod {
                         self.connection.flush()?;
                     }
                 }
-                RawEvent::Repeat { rate, delay } => {
+                RawEvent::Repeat { grab, rate, delay } => {
+                    if grab != self.grab || grab.is_null() {
+                        continue;
+                    }
                     self.repeat_rate = rate;
                     self.repeat_delay = delay;
                     if rate == 0 {
@@ -787,11 +827,13 @@ impl InputMethod {
                     }
                 }
                 RawEvent::Key {
+                    grab,
                     time,
                     code,
                     pressed,
                 } => {
-                    if !self.state.current.active
+                    if grab != self.grab
+                        || !self.state.current.active
                         || self.state.current.sensitive
                         || self.grab.is_null()
                     {
@@ -885,17 +927,83 @@ impl InputMethod {
             .listen(self.grab, (&GRAB_LISTENER as *const GrabListener).cast())?;
         Ok(())
     }
-    fn release_grab(&mut self) {
-        if !self.grab.is_null() {
-            // SAFETY: release is the grab's destructor (WL_MARSHAL_FLAG_DESTROY).
-            unsafe {
-                (self.connection.api.marshal)(self.grab, 0, ptr::null(), 1, 1);
-            }
-            self.grab = ptr::null_mut();
+    fn install_keymap(&mut self, file: File, bytes: &[u8]) -> Result<()> {
+        let mut keymap = xkb::Keymap::new(bytes)?;
+        self.release_forwarded();
+        keymap.modifiers(self.raw_modifiers);
+        // SAFETY: libwayland duplicates the fd while marshalling it.
+        unsafe {
+            (self.connection.api.marshal)(
+                self.keyboard,
+                0,
+                ptr::null(),
+                1,
+                0,
+                1u32,
+                file.as_raw_fd(),
+                bytes.len() as u32,
+            );
         }
+        self.keymap = Some(keymap);
+        self.send_modifiers(self.raw_modifiers);
+        Ok(())
+    }
+    fn release_grab(&mut self) -> Result<()> {
+        let grab = std::mem::replace(&mut self.grab, ptr::null_mut());
+        let result = if grab.is_null() {
+            Ok(())
+        } else {
+            // Do not destroy the local proxy yet: key events already sent by the
+            // compositor may still be in flight after the context's done event.
+            // A sync after release bounds that stream before freeing its listener.
+            unsafe {
+                (self.connection.api.marshal)(grab, 0, ptr::null(), 1, 0);
+            }
+            RetiredGrab {
+                proxy: grab,
+                destroy: self.connection.api.destroy,
+            }
+            .finish(|grab| {
+                let result = (|| {
+                    self.connection.sync()?;
+                    for event in self.connection.state.take_grab_events(grab) {
+                        match event {
+                            RawEvent::Keymap(_, file, bytes) => {
+                                self.install_keymap(file, &bytes)?
+                            }
+                            RawEvent::Modifiers(_, mask) => {
+                                self.raw_modifiers = mask;
+                                if let Some(keymap) = self.keymap.as_mut() {
+                                    keymap.modifiers(mask);
+                                }
+                            }
+                            RawEvent::Key {
+                                time,
+                                code,
+                                pressed,
+                                ..
+                            } => {
+                                // Retired keys bypass composition, including when
+                                // the newly focused field is a password entry.
+                                self.forward_physical_key(time, code, pressed)?;
+                            }
+                            RawEvent::Repeat { .. } => {}
+                            _ => unreachable!("only this grab's keyboard events were selected"),
+                        }
+                    }
+                    Ok(())
+                })();
+                // Pair a final virtual press whose physical release will now be
+                // delivered directly after the compositor relinquishes the grab.
+                self.release_forwarded();
+                result
+            })
+        };
         self.keymap = None;
         self.raw_modifiers = [0; 4];
         self.repeat = None;
+        self.connection.flush()?;
+        result
     }
     fn send_modifiers(&self, mask: [u32; 4]) {
         if self.keyboard.is_null() || self.keymap.is_none() {
@@ -925,11 +1033,16 @@ impl InputMethod {
                 "key belongs to an inactive or replaced input context",
             ));
         }
-        let index = key_index(event.keycode)?;
         if event.repeat {
             return Ok(());
         }
-        if event.pressed {
+        self.forward_physical_key(event.time, event.keycode, event.pressed)?;
+        self.connection.flush()?;
+        Ok(())
+    }
+    fn forward_physical_key(&mut self, time: u32, code: u32, pressed: bool) -> Result<()> {
+        let index = key_index(code)?;
+        if pressed {
             if self.forwarded[index] {
                 return Ok(());
             }
@@ -950,14 +1063,13 @@ impl InputMethod {
                 ptr::null(),
                 1,
                 0,
-                event.time,
-                event.keycode,
-                u32::from(event.pressed),
+                time,
+                code,
+                u32::from(pressed),
             );
         }
-        self.forwarded[index] = event.pressed;
-        self.last_time = event.time;
-        self.connection.flush()?;
+        self.forwarded[index] = pressed;
+        self.last_time = time;
         Ok(())
     }
     fn release_forwarded(&mut self) {
@@ -1109,7 +1221,7 @@ impl Drop for InputMethod {
         {
             let _ = self.send_text("", 0, None);
         }
-        self.release_grab();
+        let _ = self.release_grab();
         // SAFETY: send destructors while the display and library remain live.
         unsafe {
             if !self.keyboard.is_null() {
@@ -1288,7 +1400,7 @@ static GRAB_LISTENER: GrabListener = GrabListener {
     modifiers,
     repeat: repeat_info,
 };
-unsafe extern "C" fn keymap(data: Proxy, _: Proxy, format: u32, fd: c_int, size: u32) {
+unsafe extern "C" fn keymap(data: Proxy, grab: Proxy, format: u32, fd: c_int, size: u32) {
     let state = unsafe { &mut *data.cast::<State>() };
     if fd < 0 {
         state.failure = Some(Error::new("Wayland keymap has an invalid descriptor"));
@@ -1305,15 +1417,16 @@ unsafe extern "C" fn keymap(data: Proxy, _: Proxy, format: u32, fd: c_int, size:
         state.failure = Some(Error::new("cannot read the compositor keymap"));
         return;
     }
-    state.push(RawEvent::Keymap(file, bytes));
+    state.push(RawEvent::Keymap(grab, file, bytes));
 }
-unsafe extern "C" fn key(data: Proxy, _: Proxy, _: u32, time: u32, code: u32, pressed: u32) {
+unsafe extern "C" fn key(data: Proxy, grab: Proxy, _: u32, time: u32, code: u32, pressed: u32) {
     let state = unsafe { &mut *data.cast::<State>() };
     if pressed > 1 {
         state.failure = Some(Error::new("invalid Wayland key state"));
         return;
     }
     state.push(RawEvent::Key {
+        grab,
         time,
         code,
         pressed: pressed == 1,
@@ -1321,7 +1434,7 @@ unsafe extern "C" fn key(data: Proxy, _: Proxy, _: u32, time: u32, code: u32, pr
 }
 unsafe extern "C" fn modifiers(
     data: Proxy,
-    _: Proxy,
+    grab: Proxy,
     _: u32,
     depressed: u32,
     latched: u32,
@@ -1329,21 +1442,131 @@ unsafe extern "C" fn modifiers(
     group: u32,
 ) {
     unsafe {
-        (*data.cast::<State>()).push(RawEvent::Modifiers([depressed, latched, locked, group]));
+        (*data.cast::<State>()).push(RawEvent::Modifiers(
+            grab,
+            [depressed, latched, locked, group],
+        ));
     }
 }
-unsafe extern "C" fn repeat_info(data: Proxy, _: Proxy, rate: i32, delay: i32) {
+unsafe extern "C" fn repeat_info(data: Proxy, grab: Proxy, rate: i32, delay: i32) {
     let state = unsafe { &mut *data.cast::<State>() };
     if rate < 0 || delay < 0 || rate > 1000 {
         state.failure = Some(Error::new("invalid compositor repeat settings"));
         return;
     }
-    state.push(RawEvent::Repeat { rate, delay });
+    state.push(RawEvent::Repeat { grab, rate, delay });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retired_proxy_lives_through_sync_and_drain_and_cleans_up_on_failure() {
+        use std::cell::Cell;
+        struct Lifetime {
+            phase: Cell<u8>,
+            destroyed_at: Cell<u8>,
+            destroys: Cell<usize>,
+        }
+        unsafe extern "C" fn destroy(proxy: Proxy) {
+            let lifetime = unsafe { &*proxy.cast::<Lifetime>() };
+            lifetime.destroyed_at.set(lifetime.phase.get());
+            lifetime.destroys.set(lifetime.destroys.get() + 1);
+        }
+        let lifetime = Lifetime {
+            phase: Cell::new(0),
+            destroyed_at: Cell::new(0),
+            destroys: Cell::new(0),
+        };
+        let proxy = ptr::from_ref(&lifetime).cast_mut().cast();
+        RetiredGrab { proxy, destroy }
+            .finish(|_| {
+                // The synchronous barrier may deliver late keyboard events.
+                assert_eq!(lifetime.destroys.get(), 0);
+                lifetime.phase.set(1);
+                // Forwarding those queued events must still precede local destroy.
+                assert_eq!(lifetime.destroys.get(), 0);
+                lifetime.phase.set(2);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(lifetime.destroyed_at.get(), 2);
+        assert_eq!(lifetime.destroys.get(), 1);
+        for iteration in 1..=16 {
+            lifetime.phase.set(0);
+            assert!(
+                RetiredGrab { proxy, destroy }
+                    .finish(|_| Err(Error::new("simulated synchronization failure")))
+                    .is_err()
+            );
+            assert_eq!(lifetime.destroys.get(), iteration + 1);
+            assert_eq!(lifetime.destroyed_at.get(), 0);
+        }
+    }
+
+    #[test]
+    fn retiring_grab_keeps_late_key_pairs_out_of_new_context_events() {
+        let old = ptr::without_provenance_mut::<c_void>(1);
+        let new = ptr::without_provenance_mut::<c_void>(2);
+        let mut state = State::default();
+        state.push(RawEvent::Deactivate);
+        state.push(RawEvent::Modifiers(old, [1, 0, 0, 0]));
+        state.push(RawEvent::Key {
+            grab: old,
+            time: 10,
+            code: 49,
+            pressed: true,
+        });
+        state.push(RawEvent::Activate);
+        state.push(RawEvent::Content(192, 8));
+        state.push(RawEvent::Key {
+            grab: new,
+            time: 11,
+            code: 23,
+            pressed: true,
+        });
+        state.push(RawEvent::Key {
+            grab: old,
+            time: 12,
+            code: 49,
+            pressed: false,
+        });
+        state.push(RawEvent::Done);
+        let retired = state.take_grab_events(old);
+        let keys = retired
+            .iter()
+            .filter_map(|event| match event {
+                RawEvent::Key { code, pressed, .. } => Some((*code, *pressed)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(keys, [(49, true), (49, false)]);
+        assert!(matches!(
+            retired.front(),
+            Some(RawEvent::Modifiers(_, [1, 0, 0, 0]))
+        ));
+        assert!(
+            retired
+                .iter()
+                .all(|event| event.keyboard_grab() == Some(old))
+        );
+        assert_eq!(state.events.len(), 5);
+        assert!(matches!(
+            state.events.pop_front(),
+            Some(RawEvent::Deactivate)
+        ));
+        assert!(matches!(state.events.pop_front(), Some(RawEvent::Activate)));
+        assert!(matches!(
+            state.events.pop_front(),
+            Some(RawEvent::Content(192, 8))
+        ));
+        assert!(
+            matches!(state.events.pop_front(), Some(RawEvent::Key { grab, code: 23, .. }) if grab == new)
+        );
+        assert!(matches!(state.events.pop_front(), Some(RawEvent::Done)));
+        assert!(state.take_grab_events(old).is_empty());
+    }
+
     #[test]
     fn activation_and_password_policy_apply_only_at_done() {
         let mut state = ProtocolState::default();
