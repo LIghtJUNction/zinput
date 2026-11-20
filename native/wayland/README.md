@@ -78,7 +78,7 @@ if context.active && !context.sensitive && input.popup_supported() {
     })?;
     match status {
         PopupPresentation::Presented => {}
-        PopupPresentation::Queued => {} // latest image waits for buffer release
+        PopupPresentation::Queued => {} // latest image waits for release/context state
         PopupPresentation::Unavailable => {} // keep application preedit
     }
 }
@@ -102,7 +102,8 @@ There are at most two shared-memory buffers and one owned pending image. A
 buffer is written again only after its `wl_buffer.release`. Further submissions
 replace the pending image, retaining only the latest one. Release handling waits
 until queued input-context changes are applied before displaying a pending
-image. Hiding, committing/clearing preedit, focus changes, sensitive input and
+image. If a read ends before a known context update's `done` event, presentation
+waits for that state batch to complete. Hiding, committing/clearing preedit, focus changes, sensitive input and
 explicit external edits discard pending candidates and remove surface content.
 An expired context cannot submit a new image. Buffer release cannot restore
 candidates from an expired context. No image is stored in a persistent file.

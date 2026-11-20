@@ -160,6 +160,17 @@ impl ProtocolState {
     fn external_change(&self) -> bool {
         self.pending_other && !self.focus_transition && self.current.active && self.pending.active
     }
+    fn popup_ready(&self) -> bool {
+        // A read can end between a context update and its done event. Holding
+        // pixels here preserves double-buffered state without redrawing a
+        // previous context while a known transition is still incomplete.
+        !self.focus_transition
+            && !self.pending_other
+            && self.current.active
+            && !self.current.sensitive
+            && self.pending.active
+            && !self.pending.sensitive
+    }
     fn done(&mut self) -> Result<Context> {
         if self.external_change() {
             self.pending.generation = self
@@ -805,7 +816,9 @@ impl InputMethod {
             }
         }
         // Apply queued context changes before release can display deferred pixels.
-        if let Some(popup) = self.popup.as_mut() {
+        if self.state.popup_ready()
+            && let Some(popup) = self.popup.as_mut()
+        {
             popup.flush_pending(self.state.current)?;
             self.connection.flush()?;
         }
@@ -1002,7 +1015,7 @@ impl InputMethod {
             .popup
             .as_mut()
             .expect("popup was initialized")
-            .present(*context, frame)?;
+            .present(*context, frame, self.state.popup_ready())?;
         self.connection.flush()?;
         Ok(status)
     }
@@ -1396,6 +1409,41 @@ mod tests {
         state.pending_other = true;
         assert!(!state.external_change());
         assert!(!state.done().unwrap().active);
+    }
+
+    #[test]
+    fn popup_waits_for_partial_context_batches_to_complete() {
+        let mut state = ProtocolState::default();
+        state.activate().unwrap();
+        assert!(!state.popup_ready());
+        state.done().unwrap();
+        assert!(state.popup_ready());
+
+        let old = state.current;
+        state.pending_other = true;
+        assert!(!state.popup_ready());
+        assert_eq!(state.current, old);
+        state.done().unwrap();
+        assert!(state.popup_ready());
+        assert_ne!(state.current.generation, old.generation);
+
+        state.content(0, 8);
+        assert!(!state.popup_ready());
+        state.done().unwrap();
+        assert!(!state.popup_ready());
+        state.content(0, 0);
+        assert!(!state.popup_ready());
+        state.done().unwrap();
+        assert!(state.popup_ready());
+
+        state.deactivate().unwrap();
+        assert!(!state.popup_ready());
+        state.done().unwrap();
+        assert!(!state.popup_ready());
+        state.activate().unwrap();
+        assert!(!state.popup_ready());
+        state.done().unwrap();
+        assert!(state.popup_ready());
     }
 
     #[test]

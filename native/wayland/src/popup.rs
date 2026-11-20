@@ -343,6 +343,7 @@ impl Popup {
         &mut self,
         context: Context,
         frame: PopupFrame<'_>,
+        context_ready: bool,
     ) -> Result<PopupPresentation> {
         if self.version < 3 && frame.scale != 1 {
             return Err(Error::new(
@@ -350,7 +351,7 @@ impl Popup {
             ));
         }
         self.schedule.request(context.generation)?;
-        if let Some(index) = self.free_slot() {
+        if context_ready && let Some(index) = self.free_slot() {
             self.draw(index, &frame)?;
             Ok(PopupPresentation::Presented)
         } else {
