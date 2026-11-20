@@ -1,0 +1,11 @@
+[package]
+name = "zinput-x11"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+authors = ["LIghtJUNction"]
+repository = "https://github.com/LIghtJUNction/zinput"
+description = "Bounded Linux XIM input-method server and input-transparent candidate popup"
+readme = "README.md"
+include = ["src/**", "native/**", "build.rs", "examples/**", "tests/**", "Cargo.toml", "README.md", "LICENSE"]

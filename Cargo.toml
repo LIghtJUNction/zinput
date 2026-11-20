@@ -31,5 +31,5 @@ name = "ime"
 harness = false
 
 [workspace]
-members = ["native/wayland"]
+members = ["native/wayland", "native/x11"]
 default-members = ["."]
