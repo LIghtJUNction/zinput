@@ -11,4 +11,4 @@ readme = "README.md"
 include = ["src/**", "examples/**", "Cargo.toml", "README.md", "LICENSE"]
 
 [dependencies]
-zsys = { version = "0.1.1", default-features = false, features = ["dylib"] }
+zsys = { version = "0.1.1", default-features = false, features = ["dylib"], git = "https://github.com/LIghtJUNction/zsys.git"}
