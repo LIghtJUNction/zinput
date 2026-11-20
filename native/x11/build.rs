@@ -27,7 +27,7 @@ fn main() {
     }
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo provides OUT_DIR"));
     let pkg = env::var("PKG_CONFIG").unwrap_or_else(|_| "pkg-config".into());
-    let packages = ["xcb-imdkit", "xcb", "xcb-shape", "xkbcommon-x11"];
+    let packages = ["xcb-imdkit", "xcb", "xcb-shape", "xcb-xkb", "xkbcommon-x11"];
     let flags = Command::new(&pkg)
         .arg("--cflags")
         .args(packages)

@@ -63,7 +63,7 @@ def main():
             str(ROOT/"tests/client.c"), *flags, "-o", binary], check=True)
         rollback = str(Path(directory)/"popup-failure")
         flags = shlex.split(run("pkg-config", "--cflags", "--libs",
-            "xcb-imdkit", "xcb", "xcb-shape", "xkbcommon-x11"))
+            "xcb-imdkit", "xcb", "xcb-shape", "xcb-xkb", "xkbcommon-x11"))
         subprocess.run(["cc", "-std=c11", "-D_DEFAULT_SOURCE", "-O2", "-Wall",
             "-Wextra", "-Werror", str(ROOT/"tests/popup_failure.c"), *flags,
             "-o", rollback], check=True)
@@ -112,6 +112,21 @@ def main():
             key("shift+Tab")
             co.wait(lambda line: line.startswith("KEY 0 P fe20 ") and int(line.split()[4]) & 1, start)
             passed("Shift Tab state preserved")
+            start = len(so.read())
+            subprocess.run(["xdotool", "keydown", "b"], env=env, check=True)
+            try:
+                so.wait(lambda line: line.startswith("KEYSYM 62 ") and line.endswith(" false"), start)
+                so.wait(lambda line: line.startswith("KEYSYM 62 ") and line.endswith(" true"), start, timeout=3)
+            finally:
+                subprocess.run(["xdotool", "keyup", "b"], env=env, check=True)
+            passed("server autorepeat is marked without generating extra key events")
+            start = len(so.read())
+            run("setxkbmap", "-layout", "de")
+            key("z")
+            so.wait(lambda line: line.startswith("KEYSYM 7a "), start)
+            run("setxkbmap", "-layout", "us")
+            key("z")
+            passed("live XKB layout replacement refreshes logical symbols")
             start = len(so.read())
             key("d")
             so.wait(lambda line: line == "DUPLICATE_REJECTED", start)

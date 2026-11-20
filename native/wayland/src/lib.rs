@@ -114,6 +114,8 @@ pub mod keysym {
     pub const UP: u32 = 0xff52;
     pub const RIGHT: u32 = 0xff53;
     pub const DOWN: u32 = 0xff54;
+    pub const PAGE_UP: u32 = 0xff55;
+    pub const PAGE_DOWN: u32 = 0xff56;
     pub const END: u32 = 0xff57;
     pub const DELETE: u32 = 0xffff;
     pub const ISO_LEFT_TAB: u32 = 0xfe20;

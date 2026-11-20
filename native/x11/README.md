@@ -11,7 +11,7 @@ own XIM connection until they reconnect.
 
 ## System requirements
 
-Install xcb-imdkit, XCB, XCB Shape, and xkbcommon-x11 development libraries,
+Install xcb-imdkit, XCB, XCB Shape, XCB XKB, and xkbcommon-x11 development libraries,
 plus a C compiler, ar and pkg-config. This crate has no Cargo dependencies.
 All native calls are implemented within this companion.
 
@@ -24,6 +24,17 @@ Process a key before asking for the next event. Forward an unconsumed key
 once with `forward_key`; forwarded presses are paired with releases in the
 same XIC. Input generation checks prevent an old input context from receiving
 a new composition update.
+
+`KeyEvent::repeat` identifies repeated presses from both ordinary X11
+release/press pairs and detectable autorepeat. All server events remain visible;
+the adapter does not synthesize repeat events. Hosts should ignore repeats for
+mode toggles while allowing repeated text, deletion and navigation. Forwarded
+repeat events must still be passed to `forward_key`.
+
+The adapter subscribes to XKB keymap replacement and keyboard-device events.
+Changing the live layout rebuilds its logical mapping and invalidates the old
+composition. Key events retain their own modifier/group state, so queued events
+are translated using the state attached to that event.
 
 `update(context, preedit, cursor, commit)` validates complete UTF-8 strings
 and cursor boundaries before I/O. Commits are converted to COMPOUND_TEXT and
@@ -56,7 +67,7 @@ cargo build -p zinput-x11 --example protocol_probe --offline
 The `protocol_probe` example is a private-display test host. Application
 engines and desktop installation remain with the consuming application.
 
-The protocol regression also requires Xvfb, xdotool, and Xlib/Xext development
+The protocol regression also requires Xvfb, xdotool, setxkbmap, and Xlib/Xext development
 libraries. It starts its own XIM name and disposable clients on an explicitly
 private display:
 
@@ -70,8 +81,9 @@ xvfb-run -a -s '-screen 0 1024x768x24 -nolisten tcp' \
 ```
 
 The checks cover real XOpenIM/XCreateIC, Chinese and kana COMPOUND_TEXT commits,
-modifier shortcuts, release pairing, owner refusal, context changes, reset and
-destruction, invalid updates, and candidate placement/input transparency.
+modifier shortcuts, release pairing, autorepeat classification, live XKB layout
+replacement, owner refusal, context changes, reset and destruction, invalid
+updates, and candidate placement/input transparency.
 A native failure-path check forces incompatible window depth and verifies that
 a subsequent candidate-window creation succeeds after rollback. These are
 transport checks; they do not establish behavior in every application or a

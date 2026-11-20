@@ -64,7 +64,8 @@ pub struct KeyEvent {
     pub keycode: u32,
     pub time: u32,
     pub pressed: bool,
-    /// X11 delivers its own repeated events; this adapter creates no repeats.
+    /// A repeated press from the X server, including detectable autorepeat.
+    /// Release events remain visible; this adapter creates no repeat events.
     pub repeat: bool,
     pub keysym: u32,
     pub text: String,
@@ -89,6 +90,8 @@ pub mod keysym {
     pub const UP: u32 = 0xff52;
     pub const RIGHT: u32 = 0xff53;
     pub const DOWN: u32 = 0xff54;
+    pub const PAGE_UP: u32 = 0xff55;
+    pub const PAGE_DOWN: u32 = 0xff56;
     pub const END: u32 = 0xff57;
     pub const DELETE: u32 = 0xffff;
     pub const ISO_LEFT_TAB: u32 = 0xfe20;
@@ -181,12 +184,46 @@ unsafe extern "C" {
     fn zix_hide_popup(server: *mut c_void) -> c_int;
 }
 
+/// Recognize both X11 repeat encodings without delaying or suppressing events.
+/// Core autorepeat emits release/press pairs with the same timestamp; clients
+/// using detectable autorepeat send another press while the key remains held.
+struct RepeatState {
+    held: [bool; 256],
+    last_release: Option<(u32, u32)>,
+}
+impl Default for RepeatState {
+    fn default() -> Self {
+        Self {
+            held: [false; 256],
+            last_release: None,
+        }
+    }
+}
+impl RepeatState {
+    fn observe(&mut self, code: u32, time: u32, pressed: bool) -> Result<bool> {
+        let held = self
+            .held
+            .get_mut(code as usize)
+            .ok_or_else(|| Error::new("X11 keycode exceeds the protocol range"))?;
+        let repeat = pressed && (*held || self.last_release == Some((code, time)));
+        let was_held = *held;
+        *held = pressed;
+        self.last_release = if !pressed && was_held {
+            Some((code, time))
+        } else {
+            None
+        };
+        Ok(repeat)
+    }
+}
+
 /// One owned XIM server connection. It must remain on its constructing thread.
 /// An existing owner of the configured name causes connect to fail; the adapter
 /// never claims the fcitx name by default and does not grab the global keyboard.
 pub struct InputMethod {
     raw: NonNull<c_void>,
     current: Context,
+    repeat: RepeatState,
     _thread: PhantomData<Rc<()>>,
 }
 
@@ -213,6 +250,7 @@ impl InputMethod {
         Ok(Self {
             raw,
             current: Context::default(),
+            repeat: RepeatState::default(),
             _thread: PhantomData,
         })
     }
@@ -246,6 +284,9 @@ impl InputMethod {
         let context = raw.context();
         match raw.kind {
             1 => {
+                if self.current != context {
+                    self.repeat = RepeatState::default();
+                }
                 self.current = context;
                 Ok(Some(Event::State(context)))
             }
@@ -267,7 +308,9 @@ impl InputMethod {
                     keycode: raw.keycode,
                     time: raw.time,
                     pressed: raw.pressed != 0,
-                    repeat: false,
+                    repeat: self
+                        .repeat
+                        .observe(raw.keycode, raw.time, raw.pressed != 0)?,
                     keysym: raw.keysym,
                     text,
                     modifiers: raw.modifiers,
@@ -492,5 +535,40 @@ mod tests {
                 .is_err()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod repeat_tests {
+    use super::RepeatState;
+
+    #[test]
+    fn detects_core_and_detectable_autorepeat() {
+        let mut state = RepeatState::default();
+        assert!(!state.observe(38, 10, true).unwrap());
+        assert!(!state.observe(38, 500, false).unwrap());
+        assert!(state.observe(38, 500, true).unwrap());
+        assert!(state.observe(38, 530, true).unwrap());
+        assert!(!state.observe(38, 600, false).unwrap());
+        assert!(!state.observe(38, 700, true).unwrap());
+    }
+
+    #[test]
+    fn repeat_requires_matching_key_and_timestamp() {
+        let mut state = RepeatState::default();
+        assert!(!state.observe(38, 10, true).unwrap());
+        assert!(!state.observe(38, 500, false).unwrap());
+        assert!(!state.observe(39, 500, true).unwrap());
+        assert!(!state.observe(38, 500, true).unwrap());
+        assert!(!state.observe(38, 600, false).unwrap());
+        assert!(!state.observe(38, 601, true).unwrap());
+        assert!(state.observe(256, 700, true).is_err());
+    }
+
+    #[test]
+    fn unpaired_release_after_focus_does_not_create_a_repeat() {
+        let mut state = RepeatState::default();
+        assert!(!state.observe(38, 500, false).unwrap());
+        assert!(!state.observe(38, 500, true).unwrap());
     }
 }

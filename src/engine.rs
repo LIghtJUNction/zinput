@@ -25,6 +25,10 @@ pub mod key {
     pub const SPACE: u32 = 8;
     pub const TAB: u32 = 9;
     pub const DELETE: u32 = 10;
+    pub const PAGE_UP: u32 = 11;
+    pub const PAGE_DOWN: u32 = 12;
+    pub const HOME: u32 = 13;
+    pub const END: u32 = 14;
 }
 
 /// Bit flags returned from process/select. Zero leaves the key to the frontend.

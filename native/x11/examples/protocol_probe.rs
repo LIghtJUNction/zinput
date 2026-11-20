@@ -29,6 +29,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Event::Key(key) => {
                     assert_eq!(key.context, input.context());
+                    if key.pressed {
+                        println!("KEYSYM {:x} {} {}", key.keysym, key.keycode, key.repeat);
+                    }
                     if !key.pressed {
                         input.forward_key(&key)?;
                         continue;

@@ -5,6 +5,7 @@
 #include <xcb-imdkit/encoding.h>
 #include <xcb/shape.h>
 #include <xcb/xcbext.h>
+#include <xcb/xkb.h>
 #include <xkbcommon/xkbcommon.h>
 #include <xkbcommon/xkbcommon-x11.h>
 #include <poll.h>
@@ -48,6 +49,7 @@ struct ZixServer {
     struct xkb_keymap *keymap;
     struct xkb_state *keyboard;
     int32_t device;
+    uint8_t xkb_event_base;
     IcData *contexts;
     size_t context_count;
     uint64_t next_ic, next_token, active_id, generation;
@@ -459,8 +461,20 @@ int zix_dispatch(ZixServer *s, int timeout_ms) {
         } else if (kind == XCB_SELECTION_CLEAR &&
                    ((xcb_selection_clear_event_t *)event)->selection == s->selection) {
             fatal(s, "the XIM server selection was replaced");
+        } else if (kind == s->xkb_event_base) {
+            const xcb_xkb_map_notify_event_t *xkb = (const void *)event;
+            if (xkb->xkbType == XCB_XKB_NEW_KEYBOARD_NOTIFY ||
+                xkb->xkbType == XCB_XKB_MAP_NOTIFY) {
+                /* XKB-aware clients must subscribe to these notifications.
+                   Core MappingNotify alone can leave the IME on an old map. */
+                s->device = xkb_x11_get_core_keyboard_device_id(s->connection);
+                if (s->device < 0) fatal(s, "the X11 keyboard device is unavailable");
+                else if (map_keyboard(s) && s->active_id)
+                    change_context(s, s->active_id);
+            }
         } else if (kind == XCB_MAPPING_NOTIFY) {
-            map_keyboard(s);
+            if (map_keyboard(s) && s->active_id)
+                change_context(s, s->active_id);
         } else if (kind == XCB_EXPOSE &&
                    ((xcb_expose_event_t *)event)->window == s->popup_window) {
             repaint(s);
@@ -571,6 +585,17 @@ ZixServer *zix_open(const char *name, char *output_error, size_t capacity) {
         &major, &minor, &event_base, &error_base)) {
         error(s, "the X11 XKB extension is unavailable"); goto failure;
     }
+    s->xkb_event_base = event_base;
+    const uint16_t events = XCB_XKB_EVENT_TYPE_NEW_KEYBOARD_NOTIFY |
+                            XCB_XKB_EVENT_TYPE_MAP_NOTIFY;
+    const uint16_t map_parts = XCB_XKB_MAP_PART_KEY_TYPES |
+        XCB_XKB_MAP_PART_KEY_SYMS | XCB_XKB_MAP_PART_MODIFIER_MAP |
+        XCB_XKB_MAP_PART_EXPLICIT_COMPONENTS | XCB_XKB_MAP_PART_KEY_ACTIONS |
+        XCB_XKB_MAP_PART_KEY_BEHAVIORS | XCB_XKB_MAP_PART_VIRTUAL_MODS |
+        XCB_XKB_MAP_PART_VIRTUAL_MOD_MAP;
+    if (!request_ok(s, xcb_xkb_select_events_checked(s->connection,
+        XCB_XKB_ID_USE_CORE_KBD, events, 0, events, map_parts, map_parts, NULL),
+        "cannot subscribe to X11 keyboard layout changes")) goto failure;
     s->xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
     s->device = xkb_x11_get_core_keyboard_device_id(s->connection);
     if (!s->xkb_context || s->device < 0 || !map_keyboard(s)) {
