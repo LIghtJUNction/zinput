@@ -248,11 +248,22 @@ impl State {
         }
     }
     fn take_grab_events(&mut self, grab: Proxy) -> VecDeque<RawEvent> {
+        // A later activation/deactivation may already have changed the
+        // compositor's target while release_grab synchronized. Retire this
+        // grab's complete batch without replay across that announced boundary.
+        // Content/Done alone can update the same field, including a password
+        // field's first key, and do not invalidate physical-key forwarding.
+        let replay = !self
+            .events
+            .iter()
+            .any(|event| matches!(event, RawEvent::Activate | RawEvent::Deactivate));
         let mut retired = VecDeque::new();
         for _ in 0..self.events.len() {
             let event = self.events.pop_front().expect("queue length was checked");
             if event.keyboard_grab() == Some(grab) {
-                retired.push_back(event);
+                if replay {
+                    retired.push_back(event);
+                }
             } else {
                 self.events.push_back(event);
             }
@@ -1505,7 +1516,7 @@ mod tests {
     }
 
     #[test]
-    fn retiring_grab_keeps_late_key_pairs_out_of_new_context_events() {
+    fn retiring_grab_drops_late_keys_across_new_focus_events() {
         let old = ptr::without_provenance_mut::<c_void>(1);
         let new = ptr::without_provenance_mut::<c_void>(2);
         let mut state = State::default();
@@ -1533,23 +1544,7 @@ mod tests {
         });
         state.push(RawEvent::Done);
         let retired = state.take_grab_events(old);
-        let keys = retired
-            .iter()
-            .filter_map(|event| match event {
-                RawEvent::Key { code, pressed, .. } => Some((*code, *pressed)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(keys, [(49, true), (49, false)]);
-        assert!(matches!(
-            retired.front(),
-            Some(RawEvent::Modifiers(_, [1, 0, 0, 0]))
-        ));
-        assert!(
-            retired
-                .iter()
-                .all(|event| event.keyboard_grab() == Some(old))
-        );
+        assert!(retired.is_empty());
         assert_eq!(state.events.len(), 5);
         assert!(matches!(
             state.events.pop_front(),
@@ -1565,6 +1560,91 @@ mod tests {
         );
         assert!(matches!(state.events.pop_front(), Some(RawEvent::Done)));
         assert!(state.take_grab_events(old).is_empty());
+    }
+
+    #[test]
+    fn queued_focus_boundaries_drop_the_whole_retired_key_batch() {
+        let old = ptr::without_provenance_mut::<c_void>(1);
+        for activate in [false, true] {
+            for boundary_position in 0..=2 {
+                let mut state = State::default();
+                for position in 0..=2 {
+                    if position == boundary_position {
+                        state.push(if activate {
+                            RawEvent::Activate
+                        } else {
+                            RawEvent::Deactivate
+                        });
+                    }
+                    if position < 2 {
+                        state.push(RawEvent::Key {
+                            grab: old,
+                            time: 10 + position,
+                            code: 49,
+                            pressed: position == 0,
+                        });
+                    }
+                }
+                state.push(RawEvent::Content(192, 8));
+                state.push(RawEvent::Done);
+                // Even a boundary after the key pair forbids replaying its
+                // earlier press into the compositor's now-later context.
+                assert!(state.take_grab_events(old).is_empty());
+                assert_eq!(state.events.len(), 3);
+                let boundary = state.events.pop_front().unwrap();
+                assert!(if activate {
+                    matches!(boundary, RawEvent::Activate)
+                } else {
+                    matches!(boundary, RawEvent::Deactivate)
+                });
+                assert!(matches!(
+                    state.events.pop_front(),
+                    Some(RawEvent::Content(192, 8))
+                ));
+                assert!(matches!(state.events.pop_front(), Some(RawEvent::Done)));
+            }
+        }
+    }
+
+    #[test]
+    fn same_field_content_and_done_keep_retired_password_keys_replayable() {
+        let old = ptr::without_provenance_mut::<c_void>(1);
+        let mut state = State::default();
+        state.push(RawEvent::Modifiers(old, [1, 0, 0, 0]));
+        state.push(RawEvent::Key {
+            grab: old,
+            time: 10,
+            code: 49,
+            pressed: true,
+        });
+        state.push(RawEvent::Content(192, 8));
+        state.push(RawEvent::Done);
+        state.push(RawEvent::Key {
+            grab: old,
+            time: 12,
+            code: 49,
+            pressed: false,
+        });
+        let retired = state.take_grab_events(old);
+        assert_eq!(retired.len(), 3);
+        assert!(matches!(
+            retired.front(),
+            Some(RawEvent::Modifiers(_, [1, 0, 0, 0]))
+        ));
+        let keys = retired
+            .iter()
+            .filter_map(|event| match event {
+                RawEvent::Key { code, pressed, .. } => Some((*code, *pressed)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(keys, [(49, true), (49, false)]);
+        assert_eq!(state.events.len(), 2);
+        assert!(matches!(
+            state.events.pop_front(),
+            Some(RawEvent::Content(192, 8))
+        ));
+        assert!(matches!(state.events.pop_front(), Some(RawEvent::Done)));
     }
 
     #[test]
