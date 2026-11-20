@@ -35,7 +35,7 @@ const fn message(name: &'static std::ffi::CStr, sig: &'static std::ffi::CStr) ->
 }
 static POPUP_METHODS: [Message; 1] = [message(c"destroy", c"")];
 static POPUP_EVENTS: [Message; 1] = [message(c"text_input_rectangle", c"iiii")];
-static POPUP: Interface = Interface {
+pub(crate) static POPUP: Interface = Interface {
     name: c"zwp_input_popup_surface_v2".as_ptr(),
     version: 1,
     method_count: 1,

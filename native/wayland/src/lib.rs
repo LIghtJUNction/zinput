@@ -8,7 +8,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod loader;
+mod popup;
 mod protocol;
+pub use popup::{
+    MAX_POPUP_BYTES, MAX_POPUP_DIMENSION, PopupFrame, PopupPresentation, PopupRectangle,
+};
 mod xkb;
 
 use loader::{Library, symbol};
@@ -177,6 +181,9 @@ enum RawEvent {
     Deactivate,
     Content(u32, u32),
     ChangeCause(u32),
+    PopupReleased(u64),
+    PopupRectangle(PopupRectangle),
+    PopupUnavailable,
     Done,
     Keymap(File, Vec<u8>),
     Key { time: u32, code: u32, pressed: bool },
@@ -186,6 +193,9 @@ enum RawEvent {
 #[derive(Default)]
 struct State {
     seat: Option<(u32, u32)>,
+    compositor: Option<(u32, u32)>,
+    shm: Option<u32>,
+    shm_argb8888: bool,
     im_manager: Option<u32>,
     vk_manager: Option<u32>,
     events: VecDeque<RawEvent>,
@@ -217,6 +227,7 @@ impl State {
     }
 }
 
+#[derive(Clone, Copy)]
 struct Api {
     connect: unsafe extern "C" fn(*const c_char) -> Proxy,
     disconnect: unsafe extern "C" fn(Proxy),
@@ -232,6 +243,12 @@ struct Api {
     registry: *const Interface,
     seat: *const Interface,
     callback: *const Interface,
+    compositor: *const Interface,
+    surface: *const Interface,
+    region: *const Interface,
+    shm: *const Interface,
+    shm_pool: *const Interface,
+    buffer: *const Interface,
 }
 impl Api {
     fn load(lib: &Library) -> Result<Self> {
@@ -282,6 +299,12 @@ impl Api {
             registry: lib.address(c"wl_registry_interface")?.cast(),
             seat: lib.address(c"wl_seat_interface")?.cast(),
             callback: lib.address(c"wl_callback_interface")?.cast(),
+            compositor: lib.address(c"wl_compositor_interface")?.cast(),
+            surface: lib.address(c"wl_surface_interface")?.cast(),
+            region: lib.address(c"wl_region_interface")?.cast(),
+            shm: lib.address(c"wl_shm_interface")?.cast(),
+            shm_pool: lib.address(c"wl_shm_pool_interface")?.cast(),
+            buffer: lib.address(c"wl_buffer_interface")?.cast(),
         })
     }
 }
@@ -299,6 +322,9 @@ struct Connection {
     api: Api,
     display: Proxy,
     registry: Proxy,
+    compositor: Proxy,
+    shm: Proxy,
+    popup_version: u32,
     seat: Proxy,
     im_manager: Proxy,
     vk_manager: Proxy,
@@ -313,6 +339,9 @@ impl Connection {
             api,
             display: ptr::null_mut(),
             registry: ptr::null_mut(),
+            compositor: ptr::null_mut(),
+            shm: ptr::null_mut(),
+            popup_version: 0,
             seat: ptr::null_mut(),
             im_manager: ptr::null_mut(),
             vk_manager: ptr::null_mut(),
@@ -390,7 +419,20 @@ impl Connection {
         self.listen(self.seat, (&SEAT_LISTENER as *const SeatListener).cast())?;
         self.im_manager = self.bind(im, &protocol::IM_MANAGER, 1)?;
         self.vk_manager = self.bind(vk, &protocol::VK_MANAGER, 1)?;
-        Ok(())
+        self.bind_popup_globals()
+    }
+    fn bind_popup_globals(&mut self) -> Result<()> {
+        let (Some((name, version)), Some(shm)) = (self.state.compositor, self.state.shm) else {
+            return Ok(());
+        };
+        self.popup_version = version.min(4);
+        // Descriptors are static exports from the live Wayland library.
+        self.compositor = self.bind(name, unsafe { &*self.api.compositor }, self.popup_version)?;
+        self.shm = self.bind(shm, unsafe { &*self.api.shm }, 1)?;
+        self.listen(self.shm, (&SHM_LISTENER as *const ShmListener).cast())?;
+        // Negotiate globals/formats before registering the input method. The
+        // surface stays lazy, without nested dispatch inside present_popup.
+        self.sync()
     }
     fn listen(&mut self, object: Proxy, listener: *const *const c_void) -> Result<()> {
         let data = (&mut *self.state as *mut State).cast();
@@ -508,7 +550,14 @@ impl Drop for Connection {
         // SAFETY: local proxies are destroyed before their display and library.
         unsafe {
             if !self.display.is_null() {
-                for proxy in [self.vk_manager, self.im_manager, self.seat, self.registry] {
+                for proxy in [
+                    self.shm,
+                    self.compositor,
+                    self.vk_manager,
+                    self.im_manager,
+                    self.seat,
+                    self.registry,
+                ] {
                     if !proxy.is_null() {
                         (self.api.destroy)(proxy);
                     }
@@ -535,6 +584,8 @@ struct Repeat {
 /// `dispatch` followed by `next_event` until the queue is drained. Composition
 /// policy and candidate UI remain in the engine/application.
 pub struct InputMethod {
+    // Drop native popup objects before the display and library.
+    popup: Option<popup::Popup>,
     connection: Connection,
     input: Proxy,
     keyboard: Proxy,
@@ -555,6 +606,7 @@ impl InputMethod {
         let mut connection = Connection::new()?;
         connection.bind_inputs()?;
         let mut this = Self {
+            popup: None,
             connection,
             input: ptr::null_mut(),
             keyboard: ptr::null_mut(),
@@ -628,10 +680,31 @@ impl InputMethod {
                 RawEvent::Deactivate => self.state.deactivate()?,
                 RawEvent::Content(hints, purpose) => self.state.content(hints, purpose),
                 RawEvent::ChangeCause(cause) => self.state.pending_other = cause != 0,
+                RawEvent::PopupReleased(token) => {
+                    if let Some(popup) = self.popup.as_mut() {
+                        popup.released(token);
+                    }
+                }
+                RawEvent::PopupRectangle(rectangle) => {
+                    if let Some(popup) = self.popup.as_mut() {
+                        popup.rectangle = Some(rectangle);
+                    }
+                }
+                RawEvent::PopupUnavailable => {
+                    if let Some(popup) = self.popup.as_mut() {
+                        popup.hide();
+                    }
+                    self.connection.flush()?;
+                }
                 RawEvent::Done => {
                     let focus_transition = self.state.focus_transition;
                     let external_change = self.state.external_change();
                     let current = self.state.done()?;
+                    if (focus_transition || external_change || !current.active || current.sensitive)
+                        && let Some(popup) = self.popup.as_mut()
+                    {
+                        popup.hide();
+                    }
                     if focus_transition {
                         // Activation resets the protocol preedit for this context.
                         self.preedit_present = false;
@@ -730,6 +803,11 @@ impl InputMethod {
                     return Ok(Some(Event::Key(event)));
                 }
             }
+        }
+        // Apply queued context changes before release can display deferred pixels.
+        if let Some(popup) = self.popup.as_mut() {
+            popup.flush_pending(self.state.current)?;
+            self.connection.flush()?;
         }
         if let Some(repeat) = self.repeat.as_mut().filter(|r| r.next <= Instant::now()) {
             let code = repeat.code;
@@ -891,6 +969,55 @@ impl InputMethod {
         }
         self.send_modifiers([0; 4]);
     }
+    /// Whether optional popup globals and ARGB8888 were negotiated. This
+    /// does not create a surface, take focus, or change the core IME capability.
+    pub fn popup_supported(&self) -> bool {
+        !self.connection.compositor.is_null()
+            && !self.connection.shm.is_null()
+            && self.connection.state.compositor.is_some()
+            && self.connection.state.shm.is_some()
+            && self.connection.state.shm_argb8888
+    }
+    /// Submit a borrowed image. At most two buffers are in flight, plus the
+    /// latest pending frame. Positioning belongs to the compositor, and the
+    /// popup does not receive pointer/touch input or take keyboard focus.
+    pub fn present_popup(
+        &mut self,
+        context: &Context,
+        frame: PopupFrame<'_>,
+    ) -> Result<PopupPresentation> {
+        if *context != self.state.current || !context.active || context.sensitive {
+            return Err(Error::new(
+                "popup belongs to an inactive, sensitive or replaced input context",
+            ));
+        }
+        popup::validate_frame(&frame)?;
+        if !self.popup_supported() {
+            return Ok(PopupPresentation::Unavailable);
+        }
+        if self.popup.is_none() {
+            self.popup = Some(popup::Popup::new(&mut self.connection, self.input)?);
+        }
+        let status = self
+            .popup
+            .as_mut()
+            .expect("popup was initialized")
+            .present(*context, frame)?;
+        self.connection.flush()?;
+        Ok(status)
+    }
+    /// Clear visible and pending candidates even if an earlier context expired.
+    pub fn hide_popup(&mut self) -> Result<()> {
+        if let Some(popup) = self.popup.as_mut() {
+            popup.hide();
+        }
+        self.connection.flush().map(|_| ())
+    }
+    /// Compositor hint in popup-local coordinates; not a configure handshake.
+    pub fn popup_rectangle(&self) -> Option<PopupRectangle> {
+        self.popup.as_ref().and_then(|popup| popup.rectangle)
+    }
+
     /// Atomically replace preedit and optionally insert a complete commit. The
     /// context must still match; an empty preedit clears the application's mark.
     /// Cursor is a UTF-8 byte offset or -1 to hide it. Text is limited to 4000
@@ -908,6 +1035,11 @@ impl InputMethod {
             ));
         }
         self.send_text(preedit, cursor, commit)?;
+        if preedit.is_empty()
+            && let Some(popup) = self.popup.as_mut()
+        {
+            popup.hide();
+        }
         self.connection.flush()?;
         Ok(())
     }
@@ -952,6 +1084,7 @@ impl InputMethod {
 }
 impl Drop for InputMethod {
     fn drop(&mut self) {
+        drop(self.popup.take());
         self.release_forwarded();
         if !self.input.is_null() && self.state.current.active && !self.connection.state.unavailable
         {
@@ -1013,6 +1146,8 @@ unsafe extern "C" fn global(
     let interface = unsafe { CStr::from_ptr(interface) };
     match interface.to_bytes() {
         b"wl_seat" if state.seat.is_none() => state.seat = Some((name, version)),
+        b"wl_compositor" if state.compositor.is_none() => state.compositor = Some((name, version)),
+        b"wl_shm" if state.shm.is_none() => state.shm = Some(name),
         b"zwp_input_method_manager_v2" => state.im_manager = Some(name),
         b"zwp_virtual_keyboard_manager_v1" => state.vk_manager = Some(name),
         _ => {}
@@ -1026,6 +1161,27 @@ unsafe extern "C" fn global_remove(data: Proxy, _: Proxy, name: u32) {
         || state.vk_manager == Some(name)
     {
         state.failure = Some(Error::new("Wayland input capability was removed"));
+    }
+    if state.compositor.is_some_and(|global| global.0 == name) || state.shm == Some(name) {
+        if state.compositor.is_some_and(|global| global.0 == name) {
+            state.compositor = None;
+        }
+        if state.shm == Some(name) {
+            state.shm = None;
+        }
+        state.push(RawEvent::PopupUnavailable);
+    }
+}
+#[repr(C)]
+struct ShmListener {
+    format: unsafe extern "C" fn(Proxy, Proxy, u32),
+}
+static SHM_LISTENER: ShmListener = ShmListener { format: shm_format };
+unsafe extern "C" fn shm_format(data: Proxy, _: Proxy, format: u32) {
+    if format == 0 {
+        unsafe {
+            (*data.cast::<State>()).shm_argb8888 = true;
+        }
     }
 }
 #[repr(C)]
