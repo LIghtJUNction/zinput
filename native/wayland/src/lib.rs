@@ -65,7 +65,8 @@ impl Capabilities {
 }
 
 /// The last atomically applied text-input state. A generation changes whenever
-/// activation changes; serial counts `done` events, as required by the protocol.
+/// activation changes or an explicit external edit invalidates composition.
+/// Serial counts `done` events, as required by the protocol.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Context {
     pub generation: u64,
@@ -119,9 +120,13 @@ pub mod keysym {
 struct ProtocolState {
     current: Context,
     pending: Context,
+    focus_transition: bool,
+    pending_other: bool,
 }
 impl ProtocolState {
     fn activate(&mut self) -> Result<()> {
+        self.focus_transition = true;
+        self.pending_other = false;
         self.pending = Context {
             generation: self
                 .pending
@@ -135,6 +140,7 @@ impl ProtocolState {
         Ok(())
     }
     fn deactivate(&mut self) -> Result<()> {
+        self.focus_transition = true;
         self.pending.generation = self
             .pending
             .generation
@@ -147,10 +153,22 @@ impl ProtocolState {
     fn content(&mut self, hints: u32, purpose: u32) {
         self.pending.sensitive = hints & 0xc0 != 0 || purpose == 8 || purpose == 9;
     }
-    fn done(&mut self) -> Context {
+    fn external_change(&self) -> bool {
+        self.pending_other && !self.focus_transition && self.current.active && self.pending.active
+    }
+    fn done(&mut self) -> Result<Context> {
+        if self.external_change() {
+            self.pending.generation = self
+                .pending
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| Error::new("input context generation exhausted"))?;
+        }
         self.pending.serial = self.current.serial.wrapping_add(1);
         self.current = self.pending;
-        self.current
+        self.focus_transition = false;
+        self.pending_other = false;
+        Ok(self.current)
     }
 }
 
@@ -158,6 +176,7 @@ enum RawEvent {
     Activate,
     Deactivate,
     Content(u32, u32),
+    ChangeCause(u32),
     Done,
     Keymap(File, Vec<u8>),
     Key { time: u32, code: u32, pressed: bool },
@@ -608,20 +627,27 @@ impl InputMethod {
                 RawEvent::Activate => self.state.activate()?,
                 RawEvent::Deactivate => self.state.deactivate()?,
                 RawEvent::Content(hints, purpose) => self.state.content(hints, purpose),
+                RawEvent::ChangeCause(cause) => self.state.pending_other = cause != 0,
                 RawEvent::Done => {
-                    let previous = self.state.current;
-                    let current = self.state.done();
-                    if previous.generation != current.generation {
+                    let focus_transition = self.state.focus_transition;
+                    let external_change = self.state.external_change();
+                    let current = self.state.done()?;
+                    if focus_transition {
                         // Activation resets the protocol preedit for this context.
                         self.preedit_present = false;
                     }
-                    if previous.generation != current.generation
-                        || !current.active
-                        || current.sensitive
-                    {
+                    if focus_transition || !current.active || current.sensitive {
                         self.release_forwarded();
                         self.held.fill(false);
                         self.repeat = None;
+                    }
+                    if external_change {
+                        // External edits invalidate composition, not physical key
+                        // ownership. Preserve forwarded Ctrl/Shift press pairs.
+                        self.repeat = None;
+                        if current.active && !current.sensitive && self.preedit_present {
+                            self.send_text("", 0, None)?;
+                        }
                     }
                     if current.active && !current.sensitive {
                         self.ensure_grab()?;
@@ -1054,7 +1080,11 @@ unsafe extern "C" fn deactivate(data: Proxy, _: Proxy) {
 }
 // Surrounding application text is intentionally neither copied nor retained.
 unsafe extern "C" fn surrounding(_: Proxy, _: Proxy, _: *const c_char, _: u32, _: u32) {}
-unsafe extern "C" fn cause(_: Proxy, _: Proxy, _: u32) {}
+unsafe extern "C" fn cause(data: Proxy, _: Proxy, value: u32) {
+    unsafe {
+        (*data.cast::<State>()).push(RawEvent::ChangeCause(value));
+    }
+}
 unsafe extern "C" fn content(data: Proxy, _: Proxy, hints: u32, purpose: u32) {
     unsafe {
         (*data.cast::<State>()).push(RawEvent::Content(hints, purpose));
@@ -1145,13 +1175,13 @@ mod tests {
         state.activate().unwrap();
         state.content(0x80, 8);
         assert_eq!(state.current, Context::default());
-        let password = state.done();
+        let password = state.done().unwrap();
         assert!(password.active && password.sensitive);
         assert_eq!((password.generation, password.serial), (1, 1));
         state.deactivate().unwrap();
         state.activate().unwrap();
         assert_eq!(state.current, password);
-        let normal = state.done();
+        let normal = state.done().unwrap();
         assert!(normal.active && !normal.sensitive);
         assert_eq!((normal.generation, normal.serial), (3, 2));
     }
@@ -1161,14 +1191,14 @@ mod tests {
             let mut state = ProtocolState::default();
             state.activate().unwrap();
             state.content(hints, purpose);
-            assert!(state.done().sensitive);
+            assert!(state.done().unwrap().sensitive);
         }
     }
     #[test]
     fn serial_is_protocol_u32_while_context_does_not_wrap() {
         let mut state = ProtocolState::default();
         state.current.serial = u32::MAX;
-        assert_eq!(state.done().serial, 0);
+        assert_eq!(state.done().unwrap().serial, 0);
         state.pending.generation = u64::MAX;
         assert!(state.activate().is_err());
     }
@@ -1182,5 +1212,45 @@ mod tests {
         assert!(validate_text("a\0b", 3).is_err());
         assert!(validate_text(&"a".repeat(4000), 4000).is_ok());
         assert!(validate_text(&"a".repeat(4001), 4001).is_err());
+    }
+    #[test]
+    fn external_edit_invalidates_once_without_a_focus_transition() {
+        let mut state = ProtocolState::default();
+        state.activate().unwrap();
+        let initial = state.done().unwrap();
+        state.pending_other = true;
+        assert!(state.external_change());
+        assert!(!state.focus_transition);
+        let changed = state.done().unwrap();
+        assert_eq!(changed.generation, initial.generation + 1);
+        assert!(!state.external_change());
+        assert_eq!(state.done().unwrap().generation, changed.generation);
+    }
+
+    #[test]
+    fn initial_other_and_normal_echo_do_not_reset_twice() {
+        let mut state = ProtocolState::default();
+        state.activate().unwrap();
+        state.pending_other = true;
+        assert!(!state.external_change());
+        let active = state.done().unwrap();
+        assert_eq!(active.generation, 1);
+        assert_eq!(state.done().unwrap().generation, 1);
+        state.deactivate().unwrap();
+        state.pending_other = true;
+        assert!(!state.external_change());
+        assert!(!state.done().unwrap().active);
+    }
+
+    #[test]
+    fn external_generation_exhaustion_rejects_before_applying_state() {
+        let mut state = ProtocolState::default();
+        state.activate().unwrap();
+        state.done().unwrap();
+        state.pending.generation = u64::MAX;
+        state.pending_other = true;
+        let current = state.current;
+        assert!(state.done().is_err());
+        assert_eq!(state.current, current);
     }
 }
