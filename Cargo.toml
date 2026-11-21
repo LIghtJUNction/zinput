@@ -17,7 +17,7 @@ default = []
 plugins = ["dep:zplugin"]
 
 [dependencies]
-zplugin = { version = "0.3.1", default-features = false, features = ["macros", "alloc"], optional = true, git = "https://github.com/LIghtJUNction/zplugin.git"}
+zplugin = { default-features = false, features = ["macros", "alloc"], optional = true, git = "https://github.com/LIghtJUNction/zplugin.git"}
 
 [[example]]
 name = "ime_engine"
